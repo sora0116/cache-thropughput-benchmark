@@ -10,32 +10,11 @@ import sys
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
-EVENTS_READ = [
-    "mem_load_retired.l1_hit",
-    "mem_load_retired.l2_hit",
-    "mem_load_retired.l3_hit",
-    "mem_load_retired.l3_miss",
-    "cycles",
-]
-
-EVENTS_WRITE = [
-    "l2_rqsts.rfo_hit",
-    "l2_rqsts.rfo_miss",
-    "offcore_requests.demand_rfo",
-    "cycles",
-]
-
 DEFAULT_CACHE_LINES = {
     "l1": 48 * 1024 // 64,
     "l2": 1280 * 1024 // 64,
     "l3": 18 * 1024 * 1024 // 64,
 }
-
-MISS_EVENTS = [
-    "mem_load_retired.l1_miss",
-    "mem_load_retired.l2_miss",
-    "mem_load_retired.l3_miss",
-]
 
 RESULT_RE = re.compile(r"^([^=]+)=(.+)$")
 
@@ -203,22 +182,6 @@ def parse_key_values(text: str) -> Dict[str, str]:
     return result
 
 
-def parse_perf_csv(stderr: str, event: str) -> int:
-    for line in stderr.splitlines():
-        parts = line.split(";")
-        if len(parts) < 3:
-            continue
-        value_text = parts[0].strip().replace(",", "")
-        if value_text in {"<not counted>", "<not supported>"}:
-            continue
-        normalized = parts[2].strip()
-        if "/" in normalized:
-            normalized = normalized.split("/", 1)[1].rsplit("/", 1)[0]
-        if normalized == event:
-            return int(float(value_text))
-    raise RuntimeError(f"event not found in perf output: {event}")
-
-
 def sample(
     mode: str,
     kernel: str,
@@ -236,18 +199,15 @@ def sample(
         "cycles": float(bench["cycles"]),
         "ops_per_cycle": float(bench["ops_per_cycle"]),
         "gbps": float(bench["gbps"]),
+        "pmu_l1_miss": float(bench.get("pmu_l1_miss", "0")),
+        "pmu_ll_ref": float(bench.get("pmu_ll_ref", "0")),
+        "pmu_ll_miss": float(bench.get("pmu_ll_miss", "0")),
     }
     result["actual_l1"] = 0.0
     result["actual_l2"] = 0.0
     result["actual_l3"] = 0.0
     result["actual_dram"] = 0.0
     return result
-
-
-def perf_count(event: str, bench_cmd: List[str]) -> int:
-    cmd = ["perf", "stat", "-x", ";", "-e", event, "--"] + bench_cmd
-    proc = run(cmd, capture_stderr=True)
-    return parse_perf_csv(proc.stderr, event)
 
 
 def probe_level_config(level: str, cal: Calibration) -> Tuple[Dict[str, int], Dict[str, int], Tuple[int, int, int]]:
@@ -270,20 +230,17 @@ def probe_level_config(level: str, cal: Calibration) -> Tuple[Dict[str, int], Di
 
 def probe_level_actual(level: str, cal: Calibration, operations: int, warmup: int, cpu: int) -> Dict[str, float]:
     shares, lines, evict_passes = probe_level_config(level, cal)
-    read_cmd = benchmark_args("read", "stream", shares, lines, evict_passes, operations, warmup, cpu)
-    base_cmd = benchmark_args("baseline", "stream", shares, lines, (0, 0, 0), operations, warmup, cpu)
+    measured = sample("read", "stream", shares, lines, evict_passes, operations, warmup, cpu)
+    baseline = sample("baseline", "stream", shares, lines, (0, 0, 0), operations, warmup, cpu)
 
-    measured = {event: perf_count(event, read_cmd) for event in MISS_EVENTS}
-    baseline = {event: perf_count(event, base_cmd) for event in MISS_EVENTS}
+    l1_miss = max(measured["pmu_l1_miss"] - baseline["pmu_l1_miss"], 0.0)
+    ll_ref = max(measured["pmu_ll_ref"] - baseline["pmu_ll_ref"], 0.0)
+    ll_miss = max(measured["pmu_ll_miss"] - baseline["pmu_ll_miss"], 0.0)
 
-    l1_miss = max(measured["mem_load_retired.l1_miss"] - baseline["mem_load_retired.l1_miss"], 0)
-    l2_miss = max(measured["mem_load_retired.l2_miss"] - baseline["mem_load_retired.l2_miss"], 0)
-    l3_miss = max(measured["mem_load_retired.l3_miss"] - baseline["mem_load_retired.l3_miss"], 0)
-
-    l1 = max(operations - l1_miss, 0) / operations
-    l2 = max(l1_miss - l2_miss, 0) / operations
-    l3 = max(l2_miss - l3_miss, 0) / operations
-    dram = max(l3_miss, 0) / operations
+    l1 = max(operations - l1_miss, 0.0) / operations
+    l2 = max(l1_miss - ll_ref, 0.0) / operations
+    l3 = max(ll_ref - ll_miss, 0.0) / operations
+    dram = max(ll_miss, 0.0) / operations
     total = max(l1 + l2 + l3 + dram, 1e-12)
     return {
         "actual_l1": l1 / total,

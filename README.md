@@ -26,20 +26,19 @@ CSV は既定で `results.csv` に保存されます。
 
 `--step 20` なら `0,20,40,60,80,100` の格子点から `l1+l2+l3+dram=100` を満たす全組み合わせを実行します。
 
-CSV から 2 軸固定の可視化をしたい場合は `plot_matrix_slice.py` を使います。
+CSV から `actual_*` をそのまま使って可視化したい場合は `plot_matrix_slice.py` を使います。
 
 ```sh
 ./plot_matrix_slice.py \
   --input matrix_results.csv \
   --mode read \
   --x-axis l1 \
-  --fix-l3 0 \
-  --fix-dram 20 \
+  --color-axis l2 \
   --value ops_per_cycle \
-  --output slice.png
+  --output actual_scatter.png
 ```
 
-この例では `L3=0%`, `DRAM=20%` を固定し、`L1` を横軸、`ops_per_cycle` を縦軸にした線図を出します。残る `L2` は `100 - L1 - L3 - DRAM` で自動的に決まるので、各点のラベルとして表示します。
+この例では、全測定点をそのまま使い、`actual L1` を横軸、`ops_per_cycle` を縦軸、`actual L2` を色で表した散布図を出します。固定軸の近傍抽出や許容幅による絞り込みは行いません。
 
 ## 方針
 

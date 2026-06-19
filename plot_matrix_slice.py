@@ -2,12 +2,12 @@
 
 import argparse
 from pathlib import Path
-from typing import Dict, List, Tuple
 
 import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
 import pandas as pd
 
 
@@ -19,87 +19,69 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True)
     parser.add_argument("--x-axis", choices=AXES, required=True)
-    parser.add_argument("--fix-l1", type=float)
-    parser.add_argument("--fix-l2", type=float)
-    parser.add_argument("--fix-l3", type=float)
-    parser.add_argument("--fix-dram", type=float)
+    parser.add_argument("--color-axis", choices=AXES, required=True)
     parser.add_argument("--value", choices=VALUE_COLUMNS, default="ops_per_cycle")
     parser.add_argument("--mode", choices=["read", "write"], default="read")
-    parser.add_argument("--output", default="matrix_slice.png")
+    parser.add_argument("--output", default="matrix_actual_scatter.png")
     parser.add_argument("--title", default="")
     return parser.parse_args()
 
 
-def fixed_axes(args: argparse.Namespace) -> Dict[str, float]:
-    return {
-        "l1": args.fix_l1,
-        "l2": args.fix_l2,
-        "l3": args.fix_l3,
-        "dram": args.fix_dram,
-    }
-
-
-def validate_args(args: argparse.Namespace) -> Tuple[List[str], str]:
-    fixed = fixed_axes(args)
-    fixed_count = sum(value is not None for value in fixed.values())
-    if fixed_count != 2:
-        raise SystemExit("exactly two of --fix-l1/--fix-l2/--fix-l3/--fix-dram must be specified")
-    if fixed[args.x_axis] is not None:
-        raise SystemExit(f"--fix-{args.x_axis} conflicts with --x-axis {args.x_axis}")
-
-    free_axes = [axis for axis in AXES if axis != args.x_axis and fixed[axis] is None]
-    if len(free_axes) != 1:
-        raise SystemExit("with two fixed axes and one x-axis, exactly one axis must remain implicit")
-    return [axis for axis, value in fixed.items() if value is not None], free_axes[0]
-
-
 def main() -> int:
     args = parse_args()
-    fixed_names, implicit_axis = validate_args(args)
+    if args.x_axis == args.color_axis:
+        raise SystemExit("--x-axis and --color-axis must be different")
 
     df = pd.read_csv(args.input)
     df = df[df["mode"] == args.mode].copy()
     if df.empty:
         raise SystemExit(f"no rows for mode={args.mode}")
 
-    fixed = fixed_axes(args)
-    for axis in fixed_names:
-        value = fixed[axis] / 100.0
-        df = df[df[f"target_{axis}"].round(8) == round(value, 8)]
+    x_col = f"actual_{args.x_axis}"
+    color_col = f"actual_{args.color_axis}"
+    df = df.sort_values(by=x_col).copy()
 
-    if df.empty:
-        raise SystemExit("no rows matched the requested fixed axes")
+    fig, ax = plt.subplots(figsize=(10.5, 6.5))
+    scatter = ax.scatter(
+        df[x_col] * 100.0,
+        df[args.value],
+        c=df[color_col] * 100.0,
+        cmap="cividis",
+        s=52,
+        alpha=0.9,
+        edgecolors="white",
+        linewidths=0.7,
+    )
 
-    df = df.sort_values(by=f"target_{args.x_axis}").copy()
-    x_col = f"target_{args.x_axis}"
-    implicit_col = f"target_{implicit_axis}"
-
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(df[x_col] * 100.0, df[args.value], marker="o")
-
-    for _, row in df.iterrows():
-        ax.annotate(
-            f"{row[implicit_col] * 100:.0f}",
-            (row[x_col] * 100.0, row[args.value]),
-            textcoords="offset points",
-            xytext=(0, 6),
-            ha="center",
-            fontsize=8,
-        )
-
-    ax.set_xlabel(f"{args.x_axis.upper()} target (%)")
+    ax.set_xlabel(f"{args.x_axis.upper()} actual (%)")
     ax.set_ylabel(args.value)
-    ax.grid(True, alpha=0.3)
+    ax.grid(True, which="major", axis="both", color="#c7d0d9", alpha=0.45, linewidth=0.8)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.xaxis.set_major_locator(MaxNLocator(nbins=10))
+    ax.yaxis.set_major_locator(MaxNLocator(nbins=7))
 
     if args.title:
         title = args.title
     else:
-        fixed_text = ", ".join(f"{axis.upper()}={fixed[axis]:.0f}%" for axis in fixed_names)
-        title = f"{args.value} vs {args.x_axis.upper()} ({args.mode}, {fixed_text}, implicit {implicit_axis.upper()})"
+        title = f"{args.value} vs {args.x_axis.upper()} actual ({args.mode})"
     ax.set_title(title)
 
+    remaining_axes = [axis.upper() for axis in AXES if axis not in (args.x_axis, args.color_axis)]
+    colorbar = fig.colorbar(scatter, ax=ax, pad=0.02)
+    colorbar.set_label(f"{args.color_axis.upper()} actual (%)")
+
+    fig.text(
+        0.12,
+        0.02,
+        f"Each point is one measured row. Color shows {args.color_axis.upper()} actual. "
+        f"Remaining actual axes: {', '.join(remaining_axes)}.",
+        fontsize=9,
+        color="#4b5b6a",
+    )
+
     output_path = Path(args.output)
-    fig.tight_layout()
+    fig.tight_layout(rect=(0, 0.05, 1, 1))
     fig.savefig(output_path, dpi=160)
     plt.close(fig)
     print(output_path)

@@ -8,9 +8,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
+#include <linux/perf_event.h>
 
 #ifndef CACHE_LINE_BYTES
 #define CACHE_LINE_BYTES 64
@@ -68,6 +71,21 @@ typedef struct {
     uint64_t measured_cycles;
 } state_t;
 
+typedef struct {
+    int leader_fd;
+    int ll_ref_fd;
+    int ll_miss_fd;
+    bool enabled;
+    uint64_t l1_miss;
+    uint64_t ll_ref;
+    uint64_t ll_miss;
+} pmu_state_t;
+
+typedef struct {
+    uint64_t nr;
+    uint64_t values[3];
+} pmu_group_read_t;
+
 static inline uint64_t rdtscp_serialized(void) {
     uint32_t lo = 0;
     uint32_t hi = 0;
@@ -89,6 +107,105 @@ static uint64_t monotonic_ns(void) {
         exit(2);
     }
     return ((uint64_t)ts.tv_sec * 1000000000ULL) + (uint64_t)ts.tv_nsec;
+}
+
+static long perf_event_open(struct perf_event_attr *attr, pid_t pid, int cpu, int group_fd, unsigned long flags) {
+    return syscall(__NR_perf_event_open, attr, pid, cpu, group_fd, flags);
+}
+
+static uint64_t hw_cache_config(uint64_t cache_id, uint64_t op_id, uint64_t result_id) {
+    return cache_id | (op_id << 8) | (result_id << 16);
+}
+
+static void pmu_open_counter(int *fd_out, struct perf_event_attr *attr, int group_fd, const char *name) {
+    int fd = (int)perf_event_open(attr, 0, -1, group_fd, 0);
+    if (fd < 0) {
+        fprintf(stderr, "perf_event_open failed for %s: %s\n", name, strerror(errno));
+        exit(2);
+    }
+    *fd_out = fd;
+}
+
+static void pmu_init(pmu_state_t *pmu, access_mode_t mode) {
+    memset(pmu, 0, sizeof(*pmu));
+    pmu->leader_fd = -1;
+    pmu->ll_ref_fd = -1;
+    pmu->ll_miss_fd = -1;
+
+    if (mode == MODE_WRITE) {
+        return;
+    }
+
+    struct perf_event_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.type = PERF_TYPE_HW_CACHE;
+    attr.size = sizeof(attr);
+    attr.disabled = 1;
+    attr.exclude_kernel = 1;
+    attr.exclude_hv = 1;
+    attr.exclude_idle = 1;
+    attr.read_format = PERF_FORMAT_GROUP;
+
+    attr.config = hw_cache_config(PERF_COUNT_HW_CACHE_L1D, PERF_COUNT_HW_CACHE_OP_READ, PERF_COUNT_HW_CACHE_RESULT_MISS);
+    pmu_open_counter(&pmu->leader_fd, &attr, -1, "l1d-read-miss");
+
+    attr.config = hw_cache_config(PERF_COUNT_HW_CACHE_LL, PERF_COUNT_HW_CACHE_OP_READ, PERF_COUNT_HW_CACHE_RESULT_ACCESS);
+    pmu_open_counter(&pmu->ll_ref_fd, &attr, pmu->leader_fd, "ll-read-access");
+
+    attr.config = hw_cache_config(PERF_COUNT_HW_CACHE_LL, PERF_COUNT_HW_CACHE_OP_READ, PERF_COUNT_HW_CACHE_RESULT_MISS);
+    pmu_open_counter(&pmu->ll_miss_fd, &attr, pmu->leader_fd, "ll-read-miss");
+
+    pmu->enabled = true;
+}
+
+static void pmu_start(pmu_state_t *pmu) {
+    if (!pmu->enabled) {
+        return;
+    }
+    if (ioctl(pmu->leader_fd, PERF_EVENT_IOC_RESET, PERF_IOC_FLAG_GROUP) != 0) {
+        fprintf(stderr, "PERF_EVENT_IOC_RESET failed: %s\n", strerror(errno));
+        exit(2);
+    }
+    if (ioctl(pmu->leader_fd, PERF_EVENT_IOC_ENABLE, PERF_IOC_FLAG_GROUP) != 0) {
+        fprintf(stderr, "PERF_EVENT_IOC_ENABLE failed: %s\n", strerror(errno));
+        exit(2);
+    }
+}
+
+static void pmu_stop(pmu_state_t *pmu) {
+    if (!pmu->enabled) {
+        return;
+    }
+    if (ioctl(pmu->leader_fd, PERF_EVENT_IOC_DISABLE, PERF_IOC_FLAG_GROUP) != 0) {
+        fprintf(stderr, "PERF_EVENT_IOC_DISABLE failed: %s\n", strerror(errno));
+        exit(2);
+    }
+
+    pmu_group_read_t group = {0};
+    ssize_t got = read(pmu->leader_fd, &group, sizeof(group));
+    if (got < 0) {
+        fprintf(stderr, "reading PMU group failed: %s\n", strerror(errno));
+        exit(2);
+    }
+    if (group.nr < 3) {
+        fprintf(stderr, "unexpected PMU group size: %" PRIu64 "\n", group.nr);
+        exit(2);
+    }
+    pmu->l1_miss = group.values[0];
+    pmu->ll_ref = group.values[1];
+    pmu->ll_miss = group.values[2];
+}
+
+static void pmu_close(pmu_state_t *pmu) {
+    if (pmu->leader_fd >= 0) {
+        close(pmu->leader_fd);
+    }
+    if (pmu->ll_ref_fd >= 0) {
+        close(pmu->ll_ref_fd);
+    }
+    if (pmu->ll_miss_fd >= 0) {
+        close(pmu->ll_miss_fd);
+    }
 }
 
 static void pin_to_cpu(uint32_t cpu) {
@@ -754,6 +871,7 @@ int main(int argc, char **argv) {
     pin_to_cpu(cfg.cpu);
 
     state_t state = {0};
+    pmu_state_t pmu;
     uint64_t seed = cfg.seed;
     for (int level = 0; level < LEVEL_COUNT; ++level) {
         state.levels[level] = alloc_lines(cfg.lines_per_level[level]);
@@ -767,13 +885,16 @@ int main(int argc, char **argv) {
     init_lines(state.evict_l2, cfg.evict_lines_l2, &seed);
     init_lines(state.evict_l3, cfg.evict_lines_l3, &seed);
 
+    pmu_init(&pmu, cfg.mode);
     run_workload(&state, &cfg, cfg.warmup_operations);
 
     state.measured_cycles = 0;
     uint64_t start_ns = monotonic_ns();
+    pmu_start(&pmu);
     uint64_t start_cycles = rdtscp_serialized();
     run_workload(&state, &cfg, cfg.operations);
     uint64_t end_cycles = rdtscp_serialized();
+    pmu_stop(&pmu);
     uint64_t end_ns = monotonic_ns();
 
     uint64_t cycles = end_cycles - start_cycles;
@@ -791,6 +912,10 @@ int main(int argc, char **argv) {
     printf("ns=%" PRIu64 "\n", ns);
     printf("ops_per_cycle=%.9f\n", ops_per_cycle);
     printf("gbps=%.9f\n", gbps);
+    printf("pmu_l1_miss=%" PRIu64 "\n", pmu.l1_miss);
+    printf("pmu_ll_ref=%" PRIu64 "\n", pmu.ll_ref);
+    printf("pmu_ll_miss=%" PRIu64 "\n", pmu.ll_miss);
     printf("sink=%" PRIu64 "\n", state.sink);
+    pmu_close(&pmu);
     return 0;
 }
