@@ -1,0 +1,3 @@
+.matplotlib
+__pycache__
+*.csv

@@ -119,7 +119,10 @@ def benchmark_args(
     warmup: int,
     cpu: int,
 ) -> List[str]:
-    steps = choose_steps(lines)
+    if kernel == "stream":
+        steps = {name: 1 for name in ("l1", "l2", "l3", "dram")}
+    else:
+        steps = choose_steps(lines)
     return [
         "./benchmark",
         "--mode",
@@ -199,6 +202,8 @@ def sample(
         "cycles": float(bench["cycles"]),
         "ops_per_cycle": float(bench["ops_per_cycle"]),
         "gbps": float(bench["gbps"]),
+        "pmu_instructions": float(bench.get("pmu_instructions", "0")),
+        "instructions_per_op": float(bench.get("instructions_per_op", "0")),
         "pmu_l1_miss": float(bench.get("pmu_l1_miss", "0")),
         "pmu_ll_ref": float(bench.get("pmu_ll_ref", "0")),
         "pmu_ll_miss": float(bench.get("pmu_ll_miss", "0")),
@@ -272,15 +277,11 @@ def calibrate(targets: Dict[str, float], operations: int, warmup: int, cpu: int)
     actual = {name: shares[name] / 100.0 for name in ("l1", "l2", "l3", "dram")}
     high_l1 = actual["l1"] >= 0.7
     lines = {
-        "l1": 8 if actual["l1"] >= 0.95 else 16 if actual["l1"] >= 0.7 else 32 if actual["l1"] >= 0.4 else 64,
+        "l1": 64 if shares["l1"] > 0 else 64,
         "l2": 2048 if shares["l2"] > 0 else 64,
         "l3": 65536 if shares["l3"] > 0 else 64,
         "dram": 393216 if shares["dram"] > 0 else 64,
     }
-    if actual["l3"] >= 0.2:
-        lines["l3"] = 131072
-    if actual["dram"] >= 0.2:
-        lines["dram"] = 786432
     evict_passes = (0, 0, 0) if high_l1 else (1, 0, 0) if actual["l2"] >= 0.4 else (1, 1, 0) if actual["l3"] > 0 else (1, 1, 1)
     return Calibration(lines=lines, shares=shares, evict_passes=evict_passes, actual={f"actual_{k}": v for k, v in actual.items()}, score=0.0)
 
@@ -309,6 +310,8 @@ def write_csv(path: str, rows: List[Dict[str, float]]) -> None:
         "cycles",
         "ops_per_cycle",
         "gbps",
+        "pmu_instructions",
+        "instructions_per_op",
         "lines_l1",
         "lines_l2",
         "lines_l3",
@@ -375,6 +378,8 @@ def main() -> int:
             "cycles": median["cycles"],
             "ops_per_cycle": median["ops_per_cycle"],
             "gbps": median["gbps"],
+            "pmu_instructions": median["pmu_instructions"],
+            "instructions_per_op": median["instructions_per_op"],
             "lines_l1": cal.lines["l1"],
             "lines_l2": cal.lines["l2"],
             "lines_l3": cal.lines["l3"],
@@ -391,7 +396,8 @@ def main() -> int:
         print(
             f"{mode}: target=({targets['l1']:.2%}, {targets['l2']:.2%}, {targets['l3']:.2%}, {targets['dram']:.2%}) "
             f"actual=({median['actual_l1']:.2%}, {median['actual_l2']:.2%}, {median['actual_l3']:.2%}, {median['actual_dram']:.2%}) "
-            f"ops/cycle={median['ops_per_cycle']:.6f} gbps={median['gbps']:.6f}"
+            f"ops/cycle={median['ops_per_cycle']:.6f} gbps={median['gbps']:.6f} "
+            f"instr/op={median['instructions_per_op']:.3f}"
         )
 
     write_csv(args.output, rows)

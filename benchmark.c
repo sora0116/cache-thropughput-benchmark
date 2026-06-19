@@ -73,9 +73,12 @@ typedef struct {
 
 typedef struct {
     int leader_fd;
+    int l1_miss_fd;
     int ll_ref_fd;
     int ll_miss_fd;
     bool enabled;
+    bool has_cache_counters;
+    uint64_t instructions;
     uint64_t l1_miss;
     uint64_t ll_ref;
     uint64_t ll_miss;
@@ -83,7 +86,7 @@ typedef struct {
 
 typedef struct {
     uint64_t nr;
-    uint64_t values[3];
+    uint64_t values[4];
 } pmu_group_read_t;
 
 static inline uint64_t rdtscp_serialized(void) {
@@ -129,25 +132,31 @@ static void pmu_open_counter(int *fd_out, struct perf_event_attr *attr, int grou
 static void pmu_init(pmu_state_t *pmu, access_mode_t mode) {
     memset(pmu, 0, sizeof(*pmu));
     pmu->leader_fd = -1;
+    pmu->l1_miss_fd = -1;
     pmu->ll_ref_fd = -1;
     pmu->ll_miss_fd = -1;
 
-    if (mode == MODE_WRITE) {
-        return;
-    }
-
     struct perf_event_attr attr;
     memset(&attr, 0, sizeof(attr));
-    attr.type = PERF_TYPE_HW_CACHE;
+    attr.type = PERF_TYPE_HARDWARE;
     attr.size = sizeof(attr);
     attr.disabled = 1;
     attr.exclude_kernel = 1;
     attr.exclude_hv = 1;
     attr.exclude_idle = 1;
     attr.read_format = PERF_FORMAT_GROUP;
+    attr.config = PERF_COUNT_HW_INSTRUCTIONS;
+    pmu_open_counter(&pmu->leader_fd, &attr, -1, "instructions");
+
+    if (mode == MODE_WRITE) {
+        pmu->enabled = true;
+        return;
+    }
+
+    attr.type = PERF_TYPE_HW_CACHE;
 
     attr.config = hw_cache_config(PERF_COUNT_HW_CACHE_L1D, PERF_COUNT_HW_CACHE_OP_READ, PERF_COUNT_HW_CACHE_RESULT_MISS);
-    pmu_open_counter(&pmu->leader_fd, &attr, -1, "l1d-read-miss");
+    pmu_open_counter(&pmu->l1_miss_fd, &attr, pmu->leader_fd, "l1d-read-miss");
 
     attr.config = hw_cache_config(PERF_COUNT_HW_CACHE_LL, PERF_COUNT_HW_CACHE_OP_READ, PERF_COUNT_HW_CACHE_RESULT_ACCESS);
     pmu_open_counter(&pmu->ll_ref_fd, &attr, pmu->leader_fd, "ll-read-access");
@@ -155,6 +164,7 @@ static void pmu_init(pmu_state_t *pmu, access_mode_t mode) {
     attr.config = hw_cache_config(PERF_COUNT_HW_CACHE_LL, PERF_COUNT_HW_CACHE_OP_READ, PERF_COUNT_HW_CACHE_RESULT_MISS);
     pmu_open_counter(&pmu->ll_miss_fd, &attr, pmu->leader_fd, "ll-read-miss");
 
+    pmu->has_cache_counters = true;
     pmu->enabled = true;
 }
 
@@ -187,18 +197,28 @@ static void pmu_stop(pmu_state_t *pmu) {
         fprintf(stderr, "reading PMU group failed: %s\n", strerror(errno));
         exit(2);
     }
-    if (group.nr < 3) {
+    if (group.nr < 1) {
         fprintf(stderr, "unexpected PMU group size: %" PRIu64 "\n", group.nr);
         exit(2);
     }
-    pmu->l1_miss = group.values[0];
-    pmu->ll_ref = group.values[1];
-    pmu->ll_miss = group.values[2];
+    pmu->instructions = group.values[0];
+    if (pmu->has_cache_counters) {
+        if (group.nr < 4) {
+            fprintf(stderr, "unexpected PMU cache group size: %" PRIu64 "\n", group.nr);
+            exit(2);
+        }
+        pmu->l1_miss = group.values[1];
+        pmu->ll_ref = group.values[2];
+        pmu->ll_miss = group.values[3];
+    }
 }
 
 static void pmu_close(pmu_state_t *pmu) {
     if (pmu->leader_fd >= 0) {
         close(pmu->leader_fd);
+    }
+    if (pmu->l1_miss_fd >= 0) {
+        close(pmu->l1_miss_fd);
     }
     if (pmu->ll_ref_fd >= 0) {
         close(pmu->ll_ref_fd);
@@ -433,16 +453,150 @@ static inline __attribute__((always_inline)) uint64_t step_index(uint64_t idx, u
 
 static inline __attribute__((always_inline)) void stream_read_once(
         cache_line_t *base, uint64_t *idx, uint64_t step, uint64_t lines, uint64_t *sink) {
-    *sink += base[*idx].words[1];
+    uint64_t tmp;
+    (void)sink;
+    __asm__ volatile("movq %1, %0" : "=r"(tmp) : "m"(base[*idx].words[1]));
     *idx = step_index(*idx, step, lines);
 }
 
 static inline __attribute__((always_inline)) void stream_write_once(
         cache_line_t *base, uint64_t *idx, uint64_t step, uint64_t lines, uint64_t *sink) {
-    base[*idx].words[1] += 1;
-    *sink += base[*idx].words[1];
+    (void)sink;
+    __asm__ volatile("movq %1, %0" : "=m"(base[*idx].words[1]) : "r"(1ULL) : "memory");
     *idx = step_index(*idx, step, lines);
 }
+
+static inline __attribute__((always_inline)) void stream_read_block12_seq(cache_line_t *ptr) {
+    __asm__ volatile(
+            "movq 8(%0), %%rax\n\t"
+            "movq 72(%0), %%rcx\n\t"
+            "movq 136(%0), %%rdx\n\t"
+            "movq 200(%0), %%rbx\n\t"
+            "movq 264(%0), %%r8\n\t"
+            "movq 328(%0), %%r9\n\t"
+            "movq 392(%0), %%r10\n\t"
+            "movq 456(%0), %%r11\n\t"
+            "movq 520(%0), %%r12\n\t"
+            "movq 584(%0), %%r13\n\t"
+            "movq 648(%0), %%r14\n\t"
+            "movq 712(%0), %%r15\n\t"
+            :
+            : "r"(ptr)
+            : "rax", "rbx", "rcx", "rdx", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "memory");
+}
+
+static inline __attribute__((always_inline)) void stream_write_block12_seq(cache_line_t *ptr) {
+    __asm__ volatile(
+            "movq %1, 8(%0)\n\t"
+            "movq %1, 72(%0)\n\t"
+            "movq %1, 136(%0)\n\t"
+            "movq %1, 200(%0)\n\t"
+            "movq %1, 264(%0)\n\t"
+            "movq %1, 328(%0)\n\t"
+            "movq %1, 392(%0)\n\t"
+            "movq %1, 456(%0)\n\t"
+            "movq %1, 520(%0)\n\t"
+            "movq %1, 584(%0)\n\t"
+            "movq %1, 648(%0)\n\t"
+            "movq %1, 712(%0)\n\t"
+            :
+            : "r"(ptr), "r"(1ULL)
+            : "memory");
+}
+
+static inline __attribute__((always_inline)) void run_stream_level_read_seq(
+        cache_line_t *base, uint64_t *idx, uint64_t lines, uint64_t count, uint64_t *sink) {
+    cache_line_t *ptr = &base[*idx];
+    cache_line_t *end = base + lines;
+    uint64_t n = 0;
+    (void)sink;
+
+    for (; n + 12 <= count; n += 12) {
+        if ((uint64_t)(end - ptr) >= 12) {
+            stream_read_block12_seq(ptr);
+            ptr += 12;
+            if (ptr == end) {
+                ptr = base;
+            }
+        } else {
+            for (uint64_t i = 0; i < 12; ++i) {
+                uint64_t tmp;
+                __asm__ volatile("movq %1, %0" : "=r"(tmp) : "m"(ptr->words[1]));
+                ++ptr;
+                if (ptr == end) {
+                    ptr = base;
+                }
+            }
+        }
+    }
+    for (; n < count; ++n) {
+        uint64_t tmp;
+        __asm__ volatile("movq %1, %0" : "=r"(tmp) : "m"(ptr->words[1]));
+        ++ptr;
+        if (ptr == end) {
+            ptr = base;
+        }
+    }
+    *idx = (uint64_t)(ptr - base);
+}
+
+static inline __attribute__((always_inline)) void run_stream_level_write_seq(
+        cache_line_t *base, uint64_t *idx, uint64_t lines, uint64_t count, uint64_t *sink) {
+    cache_line_t *ptr = &base[*idx];
+    cache_line_t *end = base + lines;
+    uint64_t n = 0;
+    (void)sink;
+
+    for (; n + 12 <= count; n += 12) {
+        if ((uint64_t)(end - ptr) >= 12) {
+            stream_write_block12_seq(ptr);
+            ptr += 12;
+            if (ptr == end) {
+                ptr = base;
+            }
+        } else {
+            for (uint64_t i = 0; i < 12; ++i) {
+                __asm__ volatile("movq %1, %0" : "=m"(ptr->words[1]) : "r"(1ULL) : "memory");
+                ++ptr;
+                if (ptr == end) {
+                    ptr = base;
+                }
+            }
+        }
+    }
+    for (; n < count; ++n) {
+        __asm__ volatile("movq %1, %0" : "=m"(ptr->words[1]) : "r"(1ULL) : "memory");
+        ++ptr;
+        if (ptr == end) {
+            ptr = base;
+        }
+    }
+    *idx = (uint64_t)(ptr - base);
+}
+
+#define REPEAT_4(stmt) \
+    do {               \
+        stmt;          \
+        stmt;          \
+        stmt;          \
+        stmt;          \
+    } while (0)
+
+#define REPEAT_16(stmt) \
+    do {                \
+        REPEAT_4(stmt); \
+        REPEAT_4(stmt); \
+        REPEAT_4(stmt); \
+        REPEAT_4(stmt); \
+    } while (0)
+
+#define REPEAT_64(stmt)  \
+    do {                 \
+        REPEAT_16(stmt); \
+        REPEAT_16(stmt); \
+        REPEAT_16(stmt); \
+        REPEAT_16(stmt); \
+    } while (0)
 
 static inline __attribute__((always_inline)) void run_stream_level_read(
         cache_line_t *base,
@@ -451,24 +605,16 @@ static inline __attribute__((always_inline)) void run_stream_level_read(
         uint64_t lines,
         uint64_t count,
         uint64_t *sink) {
+    if (step == 1 && lines > 0) {
+        run_stream_level_read_seq(base, idx, lines, count, sink);
+        return;
+    }
     uint64_t n = 0;
+    for (; n + 64 <= count; n += 64) {
+        REPEAT_64(stream_read_once(base, idx, step, lines, sink));
+    }
     for (; n + 16 <= count; n += 16) {
-        stream_read_once(base, idx, step, lines, sink);
-        stream_read_once(base, idx, step, lines, sink);
-        stream_read_once(base, idx, step, lines, sink);
-        stream_read_once(base, idx, step, lines, sink);
-        stream_read_once(base, idx, step, lines, sink);
-        stream_read_once(base, idx, step, lines, sink);
-        stream_read_once(base, idx, step, lines, sink);
-        stream_read_once(base, idx, step, lines, sink);
-        stream_read_once(base, idx, step, lines, sink);
-        stream_read_once(base, idx, step, lines, sink);
-        stream_read_once(base, idx, step, lines, sink);
-        stream_read_once(base, idx, step, lines, sink);
-        stream_read_once(base, idx, step, lines, sink);
-        stream_read_once(base, idx, step, lines, sink);
-        stream_read_once(base, idx, step, lines, sink);
-        stream_read_once(base, idx, step, lines, sink);
+        REPEAT_16(stream_read_once(base, idx, step, lines, sink));
     }
     for (; n < count; ++n) {
         stream_read_once(base, idx, step, lines, sink);
@@ -482,94 +628,122 @@ static inline __attribute__((always_inline)) void run_stream_level_write(
         uint64_t lines,
         uint64_t count,
         uint64_t *sink) {
+    if (step == 1 && lines > 0) {
+        run_stream_level_write_seq(base, idx, lines, count, sink);
+        return;
+    }
     uint64_t n = 0;
+    for (; n + 64 <= count; n += 64) {
+        REPEAT_64(stream_write_once(base, idx, step, lines, sink));
+    }
     for (; n + 16 <= count; n += 16) {
-        stream_write_once(base, idx, step, lines, sink);
-        stream_write_once(base, idx, step, lines, sink);
-        stream_write_once(base, idx, step, lines, sink);
-        stream_write_once(base, idx, step, lines, sink);
-        stream_write_once(base, idx, step, lines, sink);
-        stream_write_once(base, idx, step, lines, sink);
-        stream_write_once(base, idx, step, lines, sink);
-        stream_write_once(base, idx, step, lines, sink);
-        stream_write_once(base, idx, step, lines, sink);
-        stream_write_once(base, idx, step, lines, sink);
-        stream_write_once(base, idx, step, lines, sink);
-        stream_write_once(base, idx, step, lines, sink);
-        stream_write_once(base, idx, step, lines, sink);
-        stream_write_once(base, idx, step, lines, sink);
-        stream_write_once(base, idx, step, lines, sink);
-        stream_write_once(base, idx, step, lines, sink);
+        REPEAT_16(stream_write_once(base, idx, step, lines, sink));
     }
     for (; n < count; ++n) {
         stream_write_once(base, idx, step, lines, sink);
     }
 }
 
-static void run_stream_l1_read_hotset(state_t *state, uint64_t operations) {
-    cache_line_t *l1 = state->levels[LEVEL_L1];
-    const uint64_t *p0 = &l1[0].words[1];
-    const uint64_t *p1 = &l1[1].words[1];
-    const uint64_t *p2 = &l1[2].words[1];
-    const uint64_t *p3 = &l1[3].words[1];
-    const uint64_t *p4 = &l1[4].words[1];
-    const uint64_t *p5 = &l1[5].words[1];
-    const uint64_t *p6 = &l1[6].words[1];
-    const uint64_t *p7 = &l1[7].words[1];
-    const uint64_t *q0 = &l1[0].words[2];
-    const uint64_t *q1 = &l1[1].words[2];
-    const uint64_t *q2 = &l1[2].words[2];
-    const uint64_t *q3 = &l1[3].words[2];
-    const uint64_t *q4 = &l1[4].words[2];
-    const uint64_t *q5 = &l1[5].words[2];
-    const uint64_t *q6 = &l1[6].words[2];
-    const uint64_t *q7 = &l1[7].words[2];
-    uint64_t a0 = 0;
-    uint64_t a1 = 0;
-    uint64_t a2 = 0;
-    uint64_t a3 = 0;
-    uint64_t a4 = 0;
-    uint64_t a5 = 0;
-    uint64_t a6 = 0;
-    uint64_t a7 = 0;
-    uint64_t a8 = 0;
-    uint64_t a9 = 0;
-    uint64_t a10 = 0;
-    uint64_t a11 = 0;
-    uint64_t a12 = 0;
-    uint64_t a13 = 0;
-    uint64_t a14 = 0;
-    uint64_t a15 = 0;
-    uint64_t start_cycles = rdtscp_serialized();
-    uint64_t n = 0;
-
-    for (; n + 16 <= operations; n += 16) {
-        __asm__ volatile("" ::: "memory");
-        a0 += *p0;
-        a1 += *p1;
-        a2 += *p2;
-        a3 += *p3;
-        a4 += *p4;
-        a5 += *p5;
-        a6 += *p6;
-        a7 += *p7;
-        a8 += *q0;
-        a9 += *q1;
-        a10 += *q2;
-        a11 += *q3;
-        a12 += *q4;
-        a13 += *q5;
-        a14 += *q6;
-        a15 += *q7;
+static inline __attribute__((always_inline)) void run_baseline_level(
+        uint64_t *idx, uint64_t step, uint64_t lines, uint64_t count, uint64_t addend, uint64_t *sink) {
+    for (uint64_t n = 0; n < count; ++n) {
+        *idx = step_index(*idx, step, lines);
+        *sink += *idx + addend;
     }
-    for (; n < operations; ++n) {
-        __asm__ volatile("" ::: "memory");
-        a0 += l1[n & 7U].words[1];
-    }
+}
 
-    uint64_t end_cycles = rdtscp_serialized();
-    state->sink += a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9 + a10 + a11 + a12 + a13 + a14 + a15;
-    state->measured_cycles = end_cycles - start_cycles;
+static inline __attribute__((always_inline)) void run_stream_block_baseline(
+        state_t *state, const config_t *cfg, uint64_t *idx1, uint64_t *idx2, uint64_t *idx3, uint64_t *idx4, uint64_t *sink) {
+    const bool do_evict = cfg->evict_passes_l1 || cfg->evict_passes_l2 || cfg->evict_passes_l3;
+    run_baseline_level(idx1, cfg->steps_per_level[LEVEL_L1], cfg->lines_per_level[LEVEL_L1], cfg->shares_per_level[LEVEL_L1], 0U, sink);
+    for (uint64_t n = 0; n < cfg->shares_per_level[LEVEL_L2]; ++n) {
+        if (do_evict) {
+            churn_lines(state->evict_l1, cfg->evict_lines_l1, cfg->evict_passes_l1, sink);
+        }
+        *idx2 = step_index(*idx2, cfg->steps_per_level[LEVEL_L2], cfg->lines_per_level[LEVEL_L2]);
+        *sink += *idx2 + 3U;
+    }
+    for (uint64_t n = 0; n < cfg->shares_per_level[LEVEL_L3]; ++n) {
+        if (do_evict) {
+            churn_lines(state->evict_l1, cfg->evict_lines_l1, cfg->evict_passes_l1, sink);
+            churn_lines(state->evict_l2, cfg->evict_lines_l2, cfg->evict_passes_l2, sink);
+        }
+        *idx3 = step_index(*idx3, cfg->steps_per_level[LEVEL_L3], cfg->lines_per_level[LEVEL_L3]);
+        *sink += *idx3 + 5U;
+    }
+    for (uint64_t n = 0; n < cfg->shares_per_level[LEVEL_DRAM]; ++n) {
+        if (do_evict) {
+            churn_lines(state->evict_l1, cfg->evict_lines_l1, cfg->evict_passes_l1, sink);
+            churn_lines(state->evict_l2, cfg->evict_lines_l2, cfg->evict_passes_l2, sink);
+            churn_lines(state->evict_l3, cfg->evict_lines_l3, cfg->evict_passes_l3, sink);
+        }
+        *idx4 = step_index(*idx4, cfg->steps_per_level[LEVEL_DRAM], cfg->lines_per_level[LEVEL_DRAM]);
+        *sink += *idx4 + 7U;
+    }
+}
+
+static inline __attribute__((always_inline)) void run_stream_block_read(
+        state_t *state, const config_t *cfg, cache_line_t *l1, cache_line_t *l2, cache_line_t *l3, cache_line_t *dram,
+        uint64_t *idx1, uint64_t *idx2, uint64_t *idx3, uint64_t *idx4, uint64_t *sink) {
+    const bool do_evict = cfg->evict_passes_l1 || cfg->evict_passes_l2 || cfg->evict_passes_l3;
+    run_stream_level_read(
+            l1, idx1, cfg->steps_per_level[LEVEL_L1], cfg->lines_per_level[LEVEL_L1], cfg->shares_per_level[LEVEL_L1], sink);
+    if (cfg->shares_per_level[LEVEL_L2] > 0) {
+        if (do_evict) {
+            churn_lines(state->evict_l1, cfg->evict_lines_l1, cfg->evict_passes_l1, sink);
+        }
+        run_stream_level_read(
+                l2, idx2, cfg->steps_per_level[LEVEL_L2], cfg->lines_per_level[LEVEL_L2], cfg->shares_per_level[LEVEL_L2], sink);
+    }
+    if (cfg->shares_per_level[LEVEL_L3] > 0) {
+        if (do_evict) {
+            churn_lines(state->evict_l1, cfg->evict_lines_l1, cfg->evict_passes_l1, sink);
+            churn_lines(state->evict_l2, cfg->evict_lines_l2, cfg->evict_passes_l2, sink);
+        }
+        run_stream_level_read(
+                l3, idx3, cfg->steps_per_level[LEVEL_L3], cfg->lines_per_level[LEVEL_L3], cfg->shares_per_level[LEVEL_L3], sink);
+    }
+    if (cfg->shares_per_level[LEVEL_DRAM] > 0) {
+        if (do_evict) {
+            churn_lines(state->evict_l1, cfg->evict_lines_l1, cfg->evict_passes_l1, sink);
+            churn_lines(state->evict_l2, cfg->evict_lines_l2, cfg->evict_passes_l2, sink);
+            churn_lines(state->evict_l3, cfg->evict_lines_l3, cfg->evict_passes_l3, sink);
+        }
+        run_stream_level_read(
+                dram, idx4, cfg->steps_per_level[LEVEL_DRAM], cfg->lines_per_level[LEVEL_DRAM], cfg->shares_per_level[LEVEL_DRAM], sink);
+    }
+}
+
+static inline __attribute__((always_inline)) void run_stream_block_write(
+        state_t *state, const config_t *cfg, cache_line_t *l1, cache_line_t *l2, cache_line_t *l3, cache_line_t *dram,
+        uint64_t *idx1, uint64_t *idx2, uint64_t *idx3, uint64_t *idx4, uint64_t *sink) {
+    const bool do_evict = cfg->evict_passes_l1 || cfg->evict_passes_l2 || cfg->evict_passes_l3;
+    run_stream_level_write(
+            l1, idx1, cfg->steps_per_level[LEVEL_L1], cfg->lines_per_level[LEVEL_L1], cfg->shares_per_level[LEVEL_L1], sink);
+    if (cfg->shares_per_level[LEVEL_L2] > 0) {
+        if (do_evict) {
+            churn_lines(state->evict_l1, cfg->evict_lines_l1, cfg->evict_passes_l1, sink);
+        }
+        run_stream_level_write(
+                l2, idx2, cfg->steps_per_level[LEVEL_L2], cfg->lines_per_level[LEVEL_L2], cfg->shares_per_level[LEVEL_L2], sink);
+    }
+    if (cfg->shares_per_level[LEVEL_L3] > 0) {
+        if (do_evict) {
+            churn_lines(state->evict_l1, cfg->evict_lines_l1, cfg->evict_passes_l1, sink);
+            churn_lines(state->evict_l2, cfg->evict_lines_l2, cfg->evict_passes_l2, sink);
+        }
+        run_stream_level_write(
+                l3, idx3, cfg->steps_per_level[LEVEL_L3], cfg->lines_per_level[LEVEL_L3], cfg->shares_per_level[LEVEL_L3], sink);
+    }
+    if (cfg->shares_per_level[LEVEL_DRAM] > 0) {
+        if (do_evict) {
+            churn_lines(state->evict_l1, cfg->evict_lines_l1, cfg->evict_passes_l1, sink);
+            churn_lines(state->evict_l2, cfg->evict_lines_l2, cfg->evict_passes_l2, sink);
+            churn_lines(state->evict_l3, cfg->evict_lines_l3, cfg->evict_passes_l3, sink);
+        }
+        run_stream_level_write(
+                dram, idx4, cfg->steps_per_level[LEVEL_DRAM], cfg->lines_per_level[LEVEL_DRAM], cfg->shares_per_level[LEVEL_DRAM], sink);
+    }
 }
 
 static void run_stream_workload(state_t *state, const config_t *cfg, uint64_t operations) {
@@ -581,118 +755,36 @@ static void run_stream_workload(state_t *state, const config_t *cfg, uint64_t op
     uint64_t idx2 = state->index[LEVEL_L2];
     uint64_t idx3 = state->index[LEVEL_L3];
     uint64_t idx4 = state->index[LEVEL_DRAM];
-    const uint64_t lines1 = cfg->lines_per_level[LEVEL_L1];
-    const uint64_t lines2 = cfg->lines_per_level[LEVEL_L2];
-    const uint64_t lines3 = cfg->lines_per_level[LEVEL_L3];
-    const uint64_t lines4 = cfg->lines_per_level[LEVEL_DRAM];
-    const uint64_t step1 = cfg->steps_per_level[LEVEL_L1];
-    const uint64_t step2 = cfg->steps_per_level[LEVEL_L2];
-    const uint64_t step3 = cfg->steps_per_level[LEVEL_L3];
-    const uint64_t step4 = cfg->steps_per_level[LEVEL_DRAM];
-    const uint64_t share1 = cfg->shares_per_level[LEVEL_L1];
-    const uint64_t share2 = cfg->shares_per_level[LEVEL_L2];
-    const uint64_t share3 = cfg->shares_per_level[LEVEL_L3];
-    const uint64_t share4 = cfg->shares_per_level[LEVEL_DRAM];
-    const bool do_evict = cfg->evict_passes_l1 || cfg->evict_passes_l2 || cfg->evict_passes_l3;
-    const bool l1_only = share1 == cfg->pattern_block && share2 == 0 && share3 == 0 && share4 == 0 && !do_evict;
-    const bool l1_hot_read = l1_only && cfg->mode == MODE_READ && lines1 >= 8;
     uint64_t sink = state->sink;
-
-    if (l1_hot_read) {
-        run_stream_l1_read_hotset(state, operations);
-        return;
-    }
 
     uint64_t start_cycles = rdtscp_serialized();
 
     if (cfg->mode == MODE_BASELINE) {
-        for (uint64_t block = 0; block < operations; block += cfg->pattern_block) {
-            for (uint64_t n = 0; n < share1; ++n) {
-                idx1 = step_index(idx1, step1, lines1);
-                sink += idx1;
-            }
-            for (uint64_t n = 0; n < share2; ++n) {
-                if (do_evict) {
-                    churn_lines(state->evict_l1, cfg->evict_lines_l1, cfg->evict_passes_l1, &sink);
-                }
-                idx2 = step_index(idx2, step2, lines2);
-                sink += idx2;
-            }
-            for (uint64_t n = 0; n < share3; ++n) {
-                if (do_evict) {
-                    churn_lines(state->evict_l1, cfg->evict_lines_l1, cfg->evict_passes_l1, &sink);
-                    churn_lines(state->evict_l2, cfg->evict_lines_l2, cfg->evict_passes_l2, &sink);
-                }
-                idx3 = step_index(idx3, step3, lines3);
-                sink += idx3;
-            }
-            for (uint64_t n = 0; n < share4; ++n) {
-                if (do_evict) {
-                    churn_lines(state->evict_l1, cfg->evict_lines_l1, cfg->evict_passes_l1, &sink);
-                    churn_lines(state->evict_l2, cfg->evict_lines_l2, cfg->evict_passes_l2, &sink);
-                    churn_lines(state->evict_l3, cfg->evict_lines_l3, cfg->evict_passes_l3, &sink);
-                }
-                idx4 = step_index(idx4, step4, lines4);
-                sink += idx4;
-            }
+        uint64_t blocks = operations / cfg->pattern_block;
+        uint64_t block = 0;
+        for (; block + 4 <= blocks; block += 4) {
+            REPEAT_4(run_stream_block_baseline(state, cfg, &idx1, &idx2, &idx3, &idx4, &sink));
+        }
+        for (; block < blocks; ++block) {
+            run_stream_block_baseline(state, cfg, &idx1, &idx2, &idx3, &idx4, &sink);
         }
     } else if (cfg->mode == MODE_READ) {
-        if (l1_only) {
-            run_stream_level_read(l1, &idx1, step1, lines1, operations, &sink);
-        } else {
-            for (uint64_t block = 0; block < operations; block += cfg->pattern_block) {
-                run_stream_level_read(l1, &idx1, step1, lines1, share1, &sink);
-                if (share2 > 0) {
-                    if (do_evict) {
-                        churn_lines(state->evict_l1, cfg->evict_lines_l1, cfg->evict_passes_l1, &sink);
-                    }
-                    run_stream_level_read(l2, &idx2, step2, lines2, share2, &sink);
-                }
-                if (share3 > 0) {
-                    if (do_evict) {
-                        churn_lines(state->evict_l1, cfg->evict_lines_l1, cfg->evict_passes_l1, &sink);
-                        churn_lines(state->evict_l2, cfg->evict_lines_l2, cfg->evict_passes_l2, &sink);
-                    }
-                    run_stream_level_read(l3, &idx3, step3, lines3, share3, &sink);
-                }
-                if (share4 > 0) {
-                    if (do_evict) {
-                        churn_lines(state->evict_l1, cfg->evict_lines_l1, cfg->evict_passes_l1, &sink);
-                        churn_lines(state->evict_l2, cfg->evict_lines_l2, cfg->evict_passes_l2, &sink);
-                        churn_lines(state->evict_l3, cfg->evict_lines_l3, cfg->evict_passes_l3, &sink);
-                    }
-                    run_stream_level_read(dram, &idx4, step4, lines4, share4, &sink);
-                }
-            }
+        uint64_t blocks = operations / cfg->pattern_block;
+        uint64_t block = 0;
+        for (; block + 4 <= blocks; block += 4) {
+            REPEAT_4(run_stream_block_read(state, cfg, l1, l2, l3, dram, &idx1, &idx2, &idx3, &idx4, &sink));
+        }
+        for (; block < blocks; ++block) {
+            run_stream_block_read(state, cfg, l1, l2, l3, dram, &idx1, &idx2, &idx3, &idx4, &sink);
         }
     } else {
-        if (l1_only) {
-            run_stream_level_write(l1, &idx1, step1, lines1, operations, &sink);
-        } else {
-            for (uint64_t block = 0; block < operations; block += cfg->pattern_block) {
-                run_stream_level_write(l1, &idx1, step1, lines1, share1, &sink);
-                if (share2 > 0) {
-                    if (do_evict) {
-                        churn_lines(state->evict_l1, cfg->evict_lines_l1, cfg->evict_passes_l1, &sink);
-                    }
-                    run_stream_level_write(l2, &idx2, step2, lines2, share2, &sink);
-                }
-                if (share3 > 0) {
-                    if (do_evict) {
-                        churn_lines(state->evict_l1, cfg->evict_lines_l1, cfg->evict_passes_l1, &sink);
-                        churn_lines(state->evict_l2, cfg->evict_lines_l2, cfg->evict_passes_l2, &sink);
-                    }
-                    run_stream_level_write(l3, &idx3, step3, lines3, share3, &sink);
-                }
-                if (share4 > 0) {
-                    if (do_evict) {
-                        churn_lines(state->evict_l1, cfg->evict_lines_l1, cfg->evict_passes_l1, &sink);
-                        churn_lines(state->evict_l2, cfg->evict_lines_l2, cfg->evict_passes_l2, &sink);
-                        churn_lines(state->evict_l3, cfg->evict_lines_l3, cfg->evict_passes_l3, &sink);
-                    }
-                    run_stream_level_write(dram, &idx4, step4, lines4, share4, &sink);
-                }
-            }
+        uint64_t blocks = operations / cfg->pattern_block;
+        uint64_t block = 0;
+        for (; block + 4 <= blocks; block += 4) {
+            REPEAT_4(run_stream_block_write(state, cfg, l1, l2, l3, dram, &idx1, &idx2, &idx3, &idx4, &sink));
+        }
+        for (; block < blocks; ++block) {
+            run_stream_block_write(state, cfg, l1, l2, l3, dram, &idx1, &idx2, &idx3, &idx4, &sink);
         }
     }
     uint64_t end_cycles = rdtscp_serialized();
@@ -904,6 +996,7 @@ int main(int argc, char **argv) {
     uint64_t ns = end_ns - start_ns;
     double ops_per_cycle = (double)cfg.operations / (double)cycles;
     double gbps = ((double)cfg.operations * (double)CACHE_LINE_BYTES) / (double)ns;
+    double instructions_per_op = (double)pmu.instructions / (double)cfg.operations;
 
     const char *mode_name = cfg.mode == MODE_READ ? "read" : cfg.mode == MODE_WRITE ? "write" : "baseline";
     printf("mode=%s\n", mode_name);
@@ -912,6 +1005,8 @@ int main(int argc, char **argv) {
     printf("ns=%" PRIu64 "\n", ns);
     printf("ops_per_cycle=%.9f\n", ops_per_cycle);
     printf("gbps=%.9f\n", gbps);
+    printf("pmu_instructions=%" PRIu64 "\n", pmu.instructions);
+    printf("instructions_per_op=%.9f\n", instructions_per_op);
     printf("pmu_l1_miss=%" PRIu64 "\n", pmu.l1_miss);
     printf("pmu_ll_ref=%" PRIu64 "\n", pmu.ll_ref);
     printf("pmu_ll_miss=%" PRIu64 "\n", pmu.ll_miss);

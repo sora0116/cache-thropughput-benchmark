@@ -40,6 +40,28 @@ CSV から `actual_*` をそのまま使って可視化したい場合は `plot_
 
 この例では、全測定点をそのまま使い、`actual L1` を横軸、`ops_per_cycle` を縦軸、`actual L2` を色で表した散布図を出します。固定軸の近傍抽出や許容幅による絞り込みは行いません。
 
+`actual_l1` から `actual_dram` までをそれぞれ x 軸にして、throughput との関係をまとめて見たい場合は `plot_actual_throughput.py` を使います。
+
+```sh
+./plot_actual_throughput.py \
+  --input matrix_results.csv \
+  --mode read \
+  --value gbps \
+  --output actual_throughput.png
+```
+
+この例では、`actual_l1` / `actual_l2` / `actual_l3` / `actual_dram` を x 軸、`gbps` を y 軸にした 4 枚の散布図を 1 枚にまとめて出力します。
+
+命令数を見たい場合は、同じスクリプトで `instructions_per_op` や `pmu_instructions` も描けます。
+
+```sh
+./plot_actual_throughput.py \
+  --input matrix_results.csv \
+  --mode read \
+  --value instructions_per_op \
+  --output instructions_per_op.png
+```
+
 ## 方針
 
 ### 1. ヒット率の扱い
@@ -81,13 +103,8 @@ CSV から `actual_*` をそのまま使って可視化したい場合は `plot_
 - 目的
   - できるだけ `L1` のみで回るアクセス列を作ること。
 - 作り方
-  - 非常に小さいワーキングセットを使います。
-  - 現在は `target_l1` が高いほど `lines_l1` を小さくします。
-  - 代表例:
-    - `target_l1 >= 0.95` なら `lines_l1 = 8`
-    - `target_l1 >= 0.70` なら `lines_l1 = 16`
-    - `target_l1 >= 0.40` なら `lines_l1 = 32`
-    - それ未満は `lines_l1 = 64`
+  - 小さいワーキングセットを使います。
+  - 現在は `share_l1 > 0` なら常に `lines_l1 = 64` です。
 - 補足
   - 高い `L1` では scrub を無効にします。
   - `100/0/0/0` のようなケースでは、`L1` 専用ワークロードとして扱います。
@@ -111,7 +128,6 @@ CSV から `actual_*` をそのまま使って可視化したい場合は `plot_
 - 作り方
   - `share_l3 > 0` のときだけ有効にします。
   - 既定は `lines_l3 = 65536` です。
-  - `target_l3 >= 0.2` のときは `lines_l3 = 131072` に広げます。
   - `share_l3 == 0` なら `lines_l3 = 64` に落とします。
 - 補足
   - `L3` 比率が大きいときは `evict_passes = (1, 1, 0)` を使います。
@@ -124,7 +140,6 @@ CSV から `actual_*` をそのまま使って可視化したい場合は `plot_
 - 作り方
   - `share_dram > 0` のときだけ有効にします。
   - 既定は `lines_dram = 393216` です。
-  - `target_dram >= 0.2` のときは `lines_dram = 786432` に広げます。
   - `share_dram == 0` なら `lines_dram = 64` に落とします。
 - 補足
   - DRAM を明確に混ぜたいケースでは `evict_passes = (1, 1, 1)` を使います。
@@ -141,7 +156,7 @@ CSV から `actual_*` をそのまま使って可視化したい場合は `plot_
 
 - 各階層ごとに独立した配列を持ちます。
 - 各配列のサイズは `lines_*` で決まり、1 line は 64 byte です。
-- `run_bench.py` が `target_*` に応じて `lines_*` を選びます。
+- 現在は throughput 比較の公平性を優先し、各階層で有効時の `lines_*` を固定しています。
 
 ### step
 
